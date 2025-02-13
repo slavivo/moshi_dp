@@ -8,7 +8,7 @@ from safetensors.torch import load_model
 import torch
 
 from .compression import MimiModel
-from .lm import LMModel
+from .lm import LMModel, StreamingLMModel
 from ..modules import SEANetEncoder, SEANetDecoder, transformer
 from ..quantization import SplitResidualVectorQuantizer
 
@@ -88,12 +88,12 @@ _lm_kwargs = {
     "depformer_num_layers": 6,
     "depformer_causal": True,
     "depformer_layer_scale": None,
-    "depformer_multi_linear": True,
+    "depformer_multi_linear": True, # TODO check this - I think correct for sure
     "depformer_context": 8,
     "depformer_max_period": 10000,
     "depformer_gating": "silu",
     "depformer_pos_emb": "none",
-    "depformer_weights_per_step": True,
+    "depformer_weights_per_step": True, # TODO check this - I think correct for sure as well
     "delays": [0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1],
 }
 
@@ -140,13 +140,21 @@ def get_mimi(filename: str | Path,
 
 
 def get_moshi_lm(filename: str | Path,
-                 device: torch.device | str = 'cpu') -> LMModel:
+                 device: torch.device | str = 'cpu',
+                 streaming: bool = False) -> LMModel:
     dtype = torch.bfloat16
-    model = LMModel(
-        device=device,
-        dtype=dtype,
-        **_lm_kwargs,
-    ).to(device=device, dtype=dtype)
+    if not streaming:
+        model = LMModel(
+            device=device,
+            dtype=dtype,
+            **_lm_kwargs,
+        ).to(device=device, dtype=dtype)
+    else:
+        model = StreamingLMModel(
+            device=device,
+            dtype=dtype,
+            **_lm_kwargs,
+        ).to(device=device, dtype=dtype)
     model.eval()
     if _is_safetensors(filename):
         load_model(model, filename)

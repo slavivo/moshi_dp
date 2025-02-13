@@ -20,4 +20,4 @@ from .conv import (
     unpad1d,
 )
 from .seanet import SEANetEncoder, SEANetDecoder
-from .transformer import StreamingTransformer
+from .transformer import Transformer

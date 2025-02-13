@@ -13,7 +13,7 @@ import sphn
 import torch
 from torch.profiler import profile, ProfilerActivity
 
-from moshi.models import loaders, LMGen
+from moshi.models import loaders, StreamingLMGen
 
 
 parser = argparse.ArgumentParser()
@@ -55,8 +55,8 @@ print("mimi loaded")
 print("loading moshi")
 if args.moshi_weight is None:
     args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME)
-lm = loaders.get_moshi_lm(args.moshi_weight, args.device)
-lm_gen = LMGen(lm)
+lm = loaders.get_moshi_lm(args.moshi_weight, args.device, streaming=True)
+lm_gen = StreamingLMGen(lm)
 print("lm loaded")
 
 def cb(step, total):

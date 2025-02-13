@@ -64,6 +64,8 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor):
         return _rms_norm(x, self.alpha, self.dtype, self.eps)
 
+class StreamingTransformer:
+    i = 1
 
 class LayerScale(nn.Module):
     """Layer scale from [Touvron et al 2021] (https://arxiv.org/pdf/2103.17239.pdf).
@@ -151,8 +153,7 @@ def create_sin_embedding(
     phase = positions / (max_period_tensor ** (adim / (half_dim - 1)))
     return torch.cat([torch.cos(phase), torch.sin(phase)], dim=-1)
 
-
-def multi_linear(
+def streaming_multi_linear(
     num_linear: int,
     weight: torch.Tensor,
     x: torch.Tensor,
@@ -178,6 +179,14 @@ def multi_linear(
     out = torch.stack(ys, 1)
     return out
 
+def multi_linear(num_linear: int, weight: torch.Tensor, x: torch.Tensor, offset: int):
+    B, T, C = x.shape
+    chout, chin = weight.shape
+    weight = weight.view(num_linear, -1, chin)
+    y = F.linear(x[:, 0], weight[offset]) # x[:, 0] does B, 1, C -> B, C
+    out = y.unsqueeze(1)
+    return out
+
 
 def set_attention_context(model: nn.Module, context: tp.Optional[int] = None) -> None:
     """Deactivates or changes the context span (in time steps) in a model.
@@ -191,9 +200,8 @@ def set_attention_context(model: nn.Module, context: tp.Optional[int] = None) ->
         and backward.
     """
     for module in model.modules():
-        if isinstance(module, StreamingMultiheadAttention):
+        if isinstance(module, MultiheadAttention):
             module.context = context
-
 
 class KVCacheResult(tp.NamedTuple):
     keys: torch.Tensor
@@ -206,7 +214,6 @@ class KVCacheResult(tp.NamedTuple):
         assert tuple(values.shape[:-1]) == (B, H, T)
         positions = torch.arange(T, device=keys.device, dtype=torch.long)
         return KVCacheResult(keys, values, positions)
-
 
 class RingKVCache:
     """Efficient streaming KVCache to be compatible with Cuda Graph.
@@ -277,6 +284,359 @@ class RingKVCache:
 
         return KVCacheResult(keys, values, positions)
 
+class MultiheadAttention(nn.Module):
+    """Similar to `nn.MultiheadAttention` but with support for streaming, causal evaluation.
+
+    Args:
+        embed_dim (int): Dimension to project to.
+        num_heads (int): Number of heads.
+        causal (bool): Causal mask applied automatically.
+        context (int, optional): Number of time steps the attention can access to.
+            When causal, can access `context` time steps into the past, and when non causal,
+            can access `context // 2` steps in the past, and the same in the future.
+        rope (`RotaryEmbedding`, optional): Rope embedding to use.
+        weights_per_step (int): use different weights per time step. If non zero, should correspond to the
+            number of possible time steps. # TODO do I want this? - Yes I think
+        device (torch.device, optional): Device on which to initialize.
+        dtype (torch.dtype, optional): dtype to use.
+    """
+
+    _fsdp_final = True
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        causal: bool = False,
+        context: tp.Optional[int] = None, 
+        rope: tp.Optional[RotaryEmbedding] = None,
+        weights_per_step: int = 0,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        self.embed_dim = embed_dim
+        self.causal = causal
+        self.context = context
+        self.rope = rope
+        self.num_heads = num_heads
+        self.device = device
+        self.dtype = dtype
+
+        out_dim = embed_dim
+        out_dim = 3 * embed_dim
+        mult = 1
+        self.weights_per_step = weights_per_step
+        if weights_per_step:
+            mult = weights_per_step
+        in_proj = nn.Linear(embed_dim, mult * out_dim, bias=False, **factory_kwargs)
+        # We try to follow the default PyTorch MHA convention, to easily compare results.
+        self.in_proj_weight = in_proj.weight
+        self.in_proj_bias = in_proj.bias
+        self.out_proj = nn.Linear(
+            embed_dim, mult * embed_dim, bias=False, **factory_kwargs
+        )
+        self.cache = None
+        if self.weights_per_step:
+            if not self.context:
+                self.context = 8 # TODO change this to be dynamic
+            self.cache = RingKVCache(1, self.num_heads, self.embed_dim // self.num_heads, self.context , device, dtype)
+
+    def reset_cache(self, T=None):
+        if T is None:
+            self.cache.reset()
+        else:
+            self.cache = RingKVCache(T, self.num_heads, self.embed_dim // self.num_heads, self.context , self.device, self.dtype)
+    
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cb_index: tp.Optional[int] = None):
+        B, T, C = query.shape
+
+        if self.weights_per_step and cb_index is not None:
+            projected = multi_linear(
+                self.weights_per_step, self.in_proj_weight, query, cb_index # TODO chang the 0 - it should be offset - Done I think
+            )
+        else:
+            projected = nn.functional.linear(query, self.in_proj_weight)
+        q, k, v = rearrange(
+            projected, "b t (p h d) -> p b h t d", p=3, h=self.num_heads
+        )
+
+        if self.rope:
+            if self.weights_per_step:
+                positions = torch.full(1, fill_value=cb_index, device=q.device, dtype=torch.long)
+            else:
+                positions = torch.arange(T, device=q.device)
+            q, k = self.rope(q, k, positions)
+
+        pos_k = None
+        if self.weights_per_step:
+            k, v, pos_k = self.cache.complete(k, v)
+
+        if self.causal:
+            if self.weights_per_step:
+                pos_k = pos_k.view(1, -1)
+                pos_q = cb_index + torch.arange(T, device=q.device, dtype=torch.long).view(
+                    -1, 1
+                )
+                delta = pos_q - pos_k
+                attn_bias = (pos_k >= 0) & (delta >= 0)
+            else:
+                attn_bias = torch.tril(torch.ones((T, T), device=q.device, dtype=torch.bool))
+            if self.context and self.weights_per_step:
+                attn_bias = attn_bias & (delta < self.context)
+        else:
+            attn_bias = None
+
+        x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
+
+        x = rearrange(x, "b h t d -> b t (h d)")
+        if self.weights_per_step and cb_index is not None:
+            x = multi_linear(self.weights_per_step, self.out_proj.weight, x, cb_index)
+        else:
+            x = self.out_proj(x)
+        return x
+
+
+class TransformerLayer(nn.Module):
+    """TransformerLayer with Streaming / Causal support.
+
+    Args:
+        d_model (int): Dimension of the data.
+        num_heads (int): Number of heads.
+        dim_feedforward (int): Intermediate dimension of FF module.
+        causal (bool): Causal mask applied automatically.
+        context (int, optional): Receptive field for the causal mask, infinite if None.
+        custom (bool): Use custom MHA implementation, for testing / benchmarking.
+        rope (`RotaryEmbedding`, optional): Rope embedding to use.
+        norm (str): Normalization to use. Currently, only 'layer_norm' is supported.
+        layer_scale (float, optional): If not None, LayerScale will be used with the given value as initial scale.
+        gating (str): if provided, replaces FFN with special gating, like GLU, GSiGLU etc.
+        weights_per_step (int): use different weights per time step. If non zero, should correspond to the
+            number of possible time steps.
+        skip_self_attn: If true, skips the self attention module and the norm
+        device (torch.device, optional): Device on which to initialize.
+        dtype (torch.dtype, optional): dtype to use.
+    """
+
+    _fsdp_final = True
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        dim_feedforward: int | list[int] = 2048,
+        causal: bool = False,
+        context: tp.Optional[int] = None,
+        rope: tp.Optional[RotaryEmbedding] = None,
+        norm: str = "layer_norm",
+        layer_scale: tp.Optional[float] = None,
+        gating: str = "none",
+        weights_per_step: int = 0,
+        activation=F.gelu,
+        skip_self_attn: bool = False,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+        # Redefine self_attn to our streaming multi-head attention
+        attn_kwargs: tp.Dict[str, tp.Any] = {
+            "embed_dim": d_model,
+            "num_heads": num_heads,
+        }
+        if not skip_self_attn:
+            self.self_attn: MultiheadAttention = MultiheadAttention(
+                causal=causal,
+                context=context,
+                rope=rope,
+                weights_per_step=weights_per_step,
+                **attn_kwargs,  # type: ignore
+                **factory_kwargs,  # type: ignore
+            )  # type: ignore
+            self.norm1 = create_norm_fn(norm, d_model, **factory_kwargs)
+        self.norm2 = create_norm_fn(norm, d_model, **factory_kwargs)
+        # Redefine feedforward layers to expose bias parameter
+        self.weights_per_step = weights_per_step
+        self.gating: tp.Optional[nn.Module] = None
+        self.linear1: tp.Optional[nn.Module] = None
+        self.linear2: tp.Optional[nn.Module] = None
+        self.activation = activation
+        self.skip_self_attn = skip_self_attn
+
+        if isinstance(dim_feedforward, list):
+            assert dim_feedforward
+            assert len(dim_feedforward) == weights_per_step, (
+                "Length of dim_feedforward must match weights_per_step,"
+                f" got {len(dim_feedforward)} != {weights_per_step}"
+            )
+        if gating == "none":
+            assert (
+                not weights_per_step
+            ), "weights_per_step without gating not supported for now."
+            assert not isinstance(
+                dim_feedforward, list
+            ), "List dim_feedforward without gating not supported for now."
+            self.linear1 = nn.Linear(
+                d_model, dim_feedforward, bias=False, **factory_kwargs
+            )
+            self.linear2 = nn.Linear(
+                dim_feedforward, d_model, bias=False, **factory_kwargs
+            )
+        else:
+            self.linear1 = None
+            self.linear2 = None
+            if weights_per_step:
+                if isinstance(dim_feedforward, int):
+                    dim_feedforward = [dim_feedforward] * weights_per_step
+                assert isinstance(dim_feedforward, list), dim_feedforward
+                self.gating = nn.ModuleList(
+                    [
+                        make_gating(gating, d_model, dim, **factory_kwargs)
+                        for dim in dim_feedforward
+                    ]
+                )
+            else:
+                assert isinstance(dim_feedforward, int)
+                self.gating = make_gating(
+                    gating, d_model, dim_feedforward, **factory_kwargs
+                )
+
+        self.layer_scale_1: nn.Module
+        self.layer_scale_2: nn.Module
+        if layer_scale is None:
+            self.layer_scale_1 = nn.Identity()
+            self.layer_scale_2 = nn.Identity()
+        else:
+            self.layer_scale_1 = LayerScale(d_model, layer_scale, **factory_kwargs)  # type: ignore
+            self.layer_scale_2 = LayerScale(d_model, layer_scale, **factory_kwargs)  # type: ignore
+
+    # feed forward block
+    def _ff_block(self, x: torch.Tensor, cb_index: tp.Optional[int] = None) -> torch.Tensor:
+        x_orig = x
+        x = self.norm2(x)
+        if self.gating is None:
+            assert self.linear1 is not None
+            assert self.linear2 is not None
+            update = self.linear2(self.activation(self.linear1(x)))
+        else:
+            if self.weights_per_step and cb_index is not None:
+                # This is being used
+                assert isinstance(self.gating, nn.ModuleList)
+                # B, T, D = x.shape
+                # x_flat = x.view(-1, D)
+
+                update = self.gating[cb_index](x)
+                # update = gating_out.view(B,T,-1)
+            else:
+                update = self.gating(x)
+        return x_orig + self.layer_scale_2(update)
+
+    def _sa_block(self, x: torch.Tensor, cb_index: tp.Optional[int] = None):
+        if self.skip_self_attn:
+            return x
+        x_orig = x
+        x = self.norm1(x)
+        update = self.self_attn(x, x, x, cb_index)
+        return x_orig + self.layer_scale_1(update)
+
+    def forward(self, x: torch.Tensor, cb_index: tp.Optional[int] = None):
+        with ExitStack() as stack:
+            B, T, C = x.shape
+            if x.device.type != 'cuda':
+                stack.enter_context(no_compile())
+            x = self._sa_block(x, cb_index)
+            x = self._ff_block(x, cb_index)
+            return x
+
+
+class Transformer(nn.Module):
+    """Transformer with Streaming / Causal support.
+
+    Args:
+        d_model (int): Dimension of the data.
+        num_heads (int): Number of heads.
+        dim_feedforward (int): Intermediate dimension of FF module.
+        causal (bool): Causal mask applied automatically.
+        context (int, optional): Receptive field for the causal mask, infinite if None.
+        layer_scale (float, optional): If not None, LayerScale will be used
+            with the given value as initial scale.
+        positional_embedding (str): Positional embedding strategy (sin, rope, sin_rope, or none).
+        max_period (float): Maximum period of the time embedding.
+        positional_scale (float): Scale of positional embedding, set to 0 to deactivate.
+        layer_class: (subclass of `StreamingTransformerLayer): class to use
+            to initialize the layers, allowing further customization outside of AudioCraft.
+        device (torch.device, optional): Device on which to initialize.
+        dtype (torch.dtype, optional): dtype to use.
+        **kwargs: See `StreamingTransformerLayer`.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        dim_feedforward: int | list[int] = 2048,
+        causal: bool = False,
+        context: tp.Optional[int] = None,
+        positional_embedding: str = "sin",
+        max_period: float = 10_000,
+        positional_scale: float = 1.0,
+        betas: tp.Optional[tp.Tuple[float, float]] = None,
+        layer_class: tp.Type[TransformerLayer] = TransformerLayer,
+        device=None,
+        dtype=None,
+        **kwargs,
+    ):
+        super().__init__()
+        assert d_model % num_heads == 0
+
+        self.positional_embedding = positional_embedding
+        self.max_period = max_period
+        self.positional_scale = positional_scale
+        self.betas = betas
+
+        assert positional_embedding in {"sin", "rope", "sin_rope", "none"}
+        self.rope: tp.Optional[RotaryEmbedding] = None
+        if self.positional_embedding in {"rope", "sin_rope"}:
+            self.rope = RotaryEmbedding(max_period=max_period)
+
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.layers.append(
+                layer_class(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    dim_feedforward=dim_feedforward,
+                    causal=causal,
+                    context=context,
+                    rope=self.rope,
+                    device=device,
+                    dtype=dtype,
+                    **kwargs,
+                )
+            )
+
+    def forward(self, x: torch.Tensor, cb_index: tp.Optional[int] = None, *args, **kwargs):
+        B, T, C = x.shape
+        if self.positional_embedding in {"sin", "sin_rope"}:
+            print(f"Applying positional embedding with {self.positional_embedding}")
+            positions = torch.arange(T, device=x.device).view(1, -1, 1) # TODO but probably correct
+            pos_emb = create_sin_embedding(
+                positions, C, max_period=self.max_period, dtype=x.dtype
+            )
+            x = x + self.positional_scale * pos_emb
+
+        for layer in self.layers:
+            x = layer(x, cb_index, *args, **kwargs)
+
+        return x
+    
+    def reset_cache(self, T=None):
+        for layer in self.layers:
+            if hasattr(layer, "self_attn"):
+                layer.self_attn.reset_cache(T)
 
 @dataclass
 class _MHAState:
@@ -386,7 +746,7 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
             offset_cpu = state.offset_cpu
 
         if self.weights_per_step:
-            projected = multi_linear(
+            projected = streaming_multi_linear(
                 self.weights_per_step, self.in_proj_weight, query, offset_cpu
             )
         else:
@@ -414,7 +774,7 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
 
         x = rearrange(x, "b h t d -> b t (h d)")
         if self.weights_per_step:
-            x = multi_linear(self.weights_per_step, self.out_proj.weight, x, offset_cpu)
+            x = streaming_multi_linear(self.weights_per_step, self.out_proj.weight, x, offset_cpu)
         else:
             x = self.out_proj(x)
         if state is not None:
