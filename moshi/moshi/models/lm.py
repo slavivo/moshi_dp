@@ -379,30 +379,34 @@ class LMGen(BaseLMGen, nn.Module):
         assert T <= self.lm_model.context, f"Sequence length {T} exceeds context {self.lm_model.context}"
         
         # Generate text tokens
-        transformer_out, text_logits = self.lm_model.forward_text(input_tokens)
+        input_ = input_tokens[:, :, :-1]  # Remove last token
+        transformer_out, text_logits = self.lm_model.forward_text(input_)
         text_tokens = self._sample_token(text_logits, is_text=True)
         text_tokens = text_tokens[:, 0, :]  # B,K,T -> B,T
 
         # Generate audio tokens
-        audio_tokens, depth_logits = self.depformer_step(text_tokens, transformer_out, verbose)
+        input_ = input_tokens[:, 0:8, :]
+        # Shift text tokens to the left by one
+        input_ = input_[:, :, 1:]
+        audio_tokens, depth_logits = self.depformer_step(input_, transformer_out, verbose)
         return text_tokens, audio_tokens, text_logits, depth_logits
 
     def depformer_step(
         self,
-        text_token: torch.Tensor,
+        future_tokens: torch.Tensor,
         transformer_out: torch.Tensor,
         verbose: bool = False
     ) -> tuple[torch.Tensor, tp.Optional[list[torch.Tensor]]]:
         """Process tokens through the depformer."""
-        B, T = text_token.shape
-        prev_token = text_token
+        B, K, T = future_tokens.shape
+        print(f"future_tokens shape: {future_tokens.shape}")
         depformer_tokens = []
         depformer_logits = [] if verbose else None
 
         self.lm_model.depformer.reset_cache(B*T)
 
         for cb_index in range(self.lm_model.dep_q):
-            input_ = prev_token[:, None, :]
+            input_ = future_tokens[:, cb_index, :].unsqueeze(1) # [B, dep_q, T] -> [B, 1, T]
             logits = self.lm_model.forward_depformer(cb_index, input_, transformer_out)
             
             if verbose:
@@ -411,7 +415,6 @@ class LMGen(BaseLMGen, nn.Module):
             next_token = self._sample_token(logits)
             next_token = next_token[:, 0, :]  # B,K,T -> B,T
             depformer_tokens.append(next_token)
-            prev_token = next_token
 
         out = torch.stack(depformer_tokens, dim=2)  # [B, T, dep_q]
         return out, depformer_logits
