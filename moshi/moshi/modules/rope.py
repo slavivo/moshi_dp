@@ -36,7 +36,7 @@ def apply_rope(
 
     ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
     freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
-    ts = offset.float() + torch.arange(T, device=q.device, dtype=torch.float32)
+    ts = offset.float()
     if time_before_heads:
         ts = ts.view(-1, 1, 1)
     else:
