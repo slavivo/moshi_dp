@@ -219,12 +219,14 @@ class BaseLMModel(nn.Module):
         input_ = None # Shape [B, S, dim]
         # Audio embeddings
         for cb_index in range(self.num_audio_codebooks):
+            if cb_index == self.num_audio_codebooks // 2:
+                break
             audio_emb = self.emb[cb_index](sequence[:, cb_index + self.audio_offset])
             input_ = audio_emb if input_ is None else input_ + audio_emb
             
         # Text embeddings
-        text_emb = self.text_emb(sequence[:, 0])
-        input_ = text_emb if input_ is None else input_ + text_emb
+        # text_emb = self.text_emb(sequence[:, 0])
+        # input_ = text_emb if input_ is None else input_ + text_emb
         
         # Forward through transformer
         transformer_out = self.transformer(input_)
@@ -302,17 +304,18 @@ class LMModel(BaseLMModel):
         )
 
     def forward_depformer(self, depformer_cb_index: int, sequence: torch.Tensor,
-                         transformer_out: torch.Tensor) -> torch.Tensor:
+                         transformer_out: torch.Tensor, first=False) -> torch.Tensor:
         B, K, S = sequence.shape
         assert K == 1, "Must pass codebooks one by one"
         
         # Project and add embeddings
         depformer_input = self.depformer_in[depformer_cb_index if self.depformer_multi_linear else 0](transformer_out)
-        last_token_input = (
-            self.depformer_text_emb(sequence[:, 0]) if depformer_cb_index == 0
-            else self.depformer_emb[depformer_cb_index - 1](sequence[:, 0])
-        )
-        depformer_input = depformer_input + last_token_input
+        if not first:
+            last_token_input = (
+                self.depformer_text_emb(sequence[:, 0]) if depformer_cb_index == 0
+                else self.depformer_emb[depformer_cb_index - 1](sequence[:, 0])
+            )
+            depformer_input = depformer_input + last_token_input
         
         # Forward through depformer
         depformer_input = depformer_input.view(B*S, 1, -1) # [B, S, dim] -> [B*S, 1, dim]
@@ -377,22 +380,6 @@ class LMGen(BaseLMGen, nn.Module):
         B, K, T = input_tokens.shape
         assert input_tokens.dim() == 3, "Shape should be [B, K, T]"
         assert T <= self.lm_model.context, f"Sequence length {T} exceeds context {self.lm_model.context}"
-        # Generate text tokens
-        transformer_out, text_logits = self.lm_model.forward_text(input_tokens)
-        text_tokens = self._sample_token(text_logits, is_text=True)
-        text_tokens = text_tokens[:, 0, :]  # B,K,T -> B,T
-
-        # Generate audio tokens
-        audio_tokens, _ = self.depformer_step(text_tokens, transformer_out, verbose)
-
-        return text_tokens, audio_tokens
-
-    @torch.no_grad()
-    def ft_generate(self, input_tokens: torch.Tensor, verbose: bool = False) -> tp.Tuple:
-        """Generate text and audio tokens from input tokens."""
-        B, K, T = input_tokens.shape
-        assert input_tokens.dim() == 3, "Shape should be [B, K, T]"
-        assert T <= self.lm_model.context, f"Sequence length {T} exceeds context {self.lm_model.context}"
         
         # Generate text tokens
         input_ = input_tokens[:, :, :-1]  # Remove last token
@@ -414,33 +401,38 @@ class LMGen(BaseLMGen, nn.Module):
         verbose: bool = False
     ) -> tuple[torch.Tensor, tp.Optional[list[torch.Tensor]]]:
         """Process tokens through the depformer."""
-        prev_token = None
-        if future_tokens.dim() == 2: # non forced teaching
-            B, T = future_tokens.shape
-            prev_token = future_tokens
-        elif future_tokens.dim() == 3: # forced teaching
-            B, K, T = future_tokens.shape
+        B, K, T = future_tokens.shape
+        print(f"future_tokens shape: {future_tokens.shape}")
         depformer_tokens = []
         depformer_logits = [] if verbose else None
+        total_weighted_nll = 0.0
+        sequence_length = 0
 
         self.lm_model.depformer.reset_cache(B*T)
+        loss_fn = torch.nn.CrossEntropyLoss(reduction='sum')
 
         for cb_index in range(self.lm_model.dep_q):
-            if prev_token is not None:
-                input_ = prev_token[:, None, :]
-            else:
-                input_ = future_tokens[:, cb_index, :].unsqueeze(1) # [B, dep_q, T] -> [B, 1, T]
-            logits = self.lm_model.forward_depformer(cb_index, input_, transformer_out)
+            input_ = future_tokens[:, cb_index, :].unsqueeze(1) # [B, dep_q, T] -> [B, 1, T]
+            logits = self.lm_model.forward_depformer(cb_index, input_, transformer_out, cb_index == 0)
             
+            if cb_index != self.lm_model.dep_q - 1:
+                target_tokens = future_tokens[:, cb_index+1, :].long()
+                logits = logits[:, :, 1:, :]
+                target_tokens = target_tokens[:, 1:]  
+                nll = loss_fn(logits.view(-1, logits.size(-1)), target_tokens.view(-1))
+
+                weight = 100.0 if cb_index == 0 else 1.0
+                weighted_nll = nll.sum() * weight
+                total_weighted_nll += weighted_nll
+                sequence_length += target_tokens.numel()
+                print(f"nll: {nll}, sequence_length: {target_tokens.numel()}")
+
             if verbose:
                 depformer_logits.append(logits)
                 
             next_token = self._sample_token(logits)
             next_token = next_token[:, 0, :]  # B,K,T -> B,T
             depformer_tokens.append(next_token)
-
-            if prev_token is not None:
-                prev_token = next_token
 
         out = torch.stack(depformer_tokens, dim=2)  # [B, T, dep_q]
         return out, depformer_logits

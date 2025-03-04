@@ -4,12 +4,13 @@ import time
 import random
 import numpy as np
 from moshi.models import loaders, LMGen
+import os
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--moshi-weight", type=str)
-parser.add_argument("--context", type=str, required=True)
 parser.add_argument("--steps", default=100, type=int)
 parser.add_argument("--device", type=str, default='cuda')
+parser.add_argument("-d", "--dir", type=str, default="samples")
 args = parser.parse_args()
 
 def seed_all(seed):
@@ -25,7 +26,7 @@ def seed_all(seed):
 def run_generation_step(input_, lm_gen):
     # First moshi audio then user audio
     start_time = time.time()
-    text_tokens, audio_tokens, text_logits, depth_logits = lm_gen.ft_generate(input_, verbose=True)
+    text_tokens, audio_tokens, text_logits, depth_logits = lm_gen.generate(input_, verbose=True)
     data = {
         "text_logits": text_logits.clone().detach(),
         "depth_logits": [tensor.clone().detach() for tensor in depth_logits],
@@ -42,12 +43,14 @@ def main():
     lm_gen = LMGen(lm, temp=0.0, temp_text=0.0)
     print("lm loaded")
 
-    print("loading context")
-    context = torch.load(args.context, map_location=args.device)
-    print("context loaded")
-
-    input_ = torch.cat([d['input'] for d in context], dim=2)
-    _, _, data = run_generation_step(input_, lm_gen)
+    for root, dirs, files in os.walk(args.dir):
+        for file in files:
+            if file.endswith(".pt"):
+                file = os.path.join(root, file)
+                input_ = torch.load(file) # B, 8, T
+                input_ = input_.to(args.device)
+                input_ = input_.to(torch.long)
+                _, _, data = run_generation_step(input_, lm_gen)
 
     torch.save(data, "benchmark_data.pt")
 

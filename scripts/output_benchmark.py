@@ -66,14 +66,14 @@ def run_generation_step(
             input_tensor[0, 1:9, -1].copy_(generated_audio)
 
     start_time = time.time()
-    text_tokens, audio_tokens, text_logits, depth_logits = lm_gen.generate(input_tensor, verbose=True)
+    text_tokens, audio_tokens, text_logits, depth_logits = lm_gen.ft_generate(input_tensor, verbose=True)
     generation_time = time.time() - start_time
     print(f"Generation time: {generation_time:.2f}s")
 
     generated_audio = audio_tokens[0, -1, :]
     generated_text = text_tokens[0, -1]
-
-    if generated_text not in (0, 3):
+    print(f"generated text: {generated_text.item()}")
+    if generated_text.item() not in (0, 3):
         text = text_tokenizer.id_to_piece(generated_text.item())
         text = text.replace("▁", " ")
         main_text.append(text)
