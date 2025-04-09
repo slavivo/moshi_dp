@@ -250,37 +250,43 @@ class RingKVCache:
         assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
         B, H, T, D = k.shape
         assert T > 0
-        indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype) + self.end_offset
-        indexes = indexes % self.capacity
-        self.cache[0].index_copy_(2, indexes, k)
-        self.cache[1].index_copy_(2, indexes, v)
 
-        keys = self.cache[0]
-        values = self.cache[1]
+        # Create a copy of the cache
+        cache_copy = self.cache.clone()
+        end_offset_copy = self.end_offset.clone()
+
+        indexes = torch.arange(T, device=end_offset_copy.device, dtype=end_offset_copy.dtype) + end_offset_copy
+        indexes = indexes % self.capacity
+
+        # Use functional operations instead of in-place
+        cache_copy[0] = cache_copy[0].scatter(2, indexes.view(1, 1, -1, 1).expand(B, H, T, D), k)
+        cache_copy[1] = cache_copy[1].scatter(2, indexes.view(1, 1, -1, 1).expand(B, H, T, D), v)
+
+        keys = cache_copy[0]
+        values = cache_copy[1]
 
         indexes = torch.arange(
-            self.capacity, device=self.end_offset.device, dtype=torch.long
+            self.capacity, device=end_offset_copy.device, dtype=torch.long
         )
 
-        # end_index correspond to the actual index where the last value was written.
-        last_offset = self.end_offset + T - 1
+        # Non-in-place computations
+        last_offset = end_offset_copy + T - 1
         end_index = last_offset % self.capacity
         delta = indexes - end_index
-
-        # We know that if `index == end_index`, then we should output `self.end_offset`.
-        # If `index = end_index - 1` we should output `self.end_offset - 1`
-        # If `index = end_index - n` we should output `self.end_offset - n`
-        # Now, for `index == end_index + 1` , we actually have the oldest entry in the cache,
-        # so we should output `end_index + 1 - self.capacity`
 
         positions = torch.where(
             delta <= 0,
             last_offset + delta,
             last_offset + delta - self.capacity,
         )
-        self.end_offset.add_(T)
-        invalid = indexes >= self.end_offset
+
+        new_end_offset = end_offset_copy + T
+        invalid = indexes >= new_end_offset
         positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+
+        # Update cache state after computation graph is built
+        self.cache = cache_copy
+        self.end_offset = new_end_offset
 
         return KVCacheResult(keys, values, positions)
 

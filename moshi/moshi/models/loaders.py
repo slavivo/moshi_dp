@@ -8,7 +8,7 @@ from safetensors.torch import load_model
 import torch
 
 from .compression import MimiModel
-from .lm import LMModel, StreamingLMModel
+from .lm import LMModel, StreamingLMModel, QwenLMModel
 from ..modules import SEANetEncoder, SEANetDecoder, transformer
 from ..quantization import SplitResidualVectorQuantizer
 
@@ -136,6 +136,22 @@ def get_mimi(filename: str | Path,
         pkg = torch.load(filename, "cpu")
         model.load_state_dict(pkg["model"])
     model.set_num_codebooks(8)
+    return model
+
+def get_qwen_lm(moshi_weights, qwen, device: torch.device | str = 'cpu') -> LMModel:
+    """Return a pretrained Qwen model."""
+    model = QwenLMModel(
+        device=device,
+        qwen=qwen,
+        dtype=torch.float16, # TODO change?
+        **_lm_kwargs,
+    ).to(device=device, dtype=torch.float16)
+    model.eval()
+    if _is_safetensors(moshi_weights):
+        load_model(model, moshi_weights)
+    else:
+        pkg = torch.load(moshi_weights, "cpu")
+        model.load_state_dict(pkg["fsdp_best_state"]["model"])
     return model
 
 

@@ -124,6 +124,7 @@ class BaseLMModel(nn.Module):
             dtype=dtype,
             zero_idx=self.zero_token_id,
         )
+        self.EmbeddingFactory = EmbeddingFactory
         self.emb = nn.ModuleList(
             [EmbeddingFactory(self.card + 1, self.dim) for _ in range(self.n_q)]
         )
@@ -279,7 +280,141 @@ class StreamingLMModel(BaseLMModel, StreamingContainer):
         
         assert logits.dim() == 4  # [B, Ka, S, card]
         return logits
+    
+class MLPProjector(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim)
+        )
 
+    def forward(self, x):
+        return self.mlp(x)
+
+class QwenLMModel(BaseLMModel):
+    def __init__(self, *args, qwen=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not qwen:
+            raise ValueError("Qwen model is required")
+        # TODO reinitialize self.depformer_text_emb
+        # TODO remove self.depformer_in
+        # TODO remove self.text_emb
+        # self.depformer_emb and self.linear will be kept and finetuned
+        self.depformer_in = None
+        self.text_emb = None 
+        self.text_linear = None
+        
+        self.qwen = qwen
+
+        self.text_projector = MLPProjector(2048+4096, 4096, 2048).to(self.device)
+        self.text_head = nn.Linear(
+            in_features=qwen.get_output_embeddings().in_features,
+            out_features=qwen.get_output_embeddings().out_features,
+            bias=False,
+        )
+        self.text_head.to(dtype=qwen.get_output_embeddings().weight.dtype, device=self.device)
+
+        self.depformer_projectors = nn.ModuleList(
+            [MLPProjector(4096+2048+1024, 4096, 1024).to(self.device) for _ in range(self.dep_q)]
+        )
+        # TODO remove +1
+        self.depformer_text_emb = self.EmbeddingFactory(qwen.config.vocab_size, self.depformer_dim)
+
+    def _init_transformers(self):
+        self.transformer = Transformer(
+            d_model=self.dim,
+            num_heads=self.num_heads,
+            dim_feedforward=int(self.hidden_scale * self.dim),
+            norm=self.norm,
+            device=self.device_type,
+            dtype=self.dtype,
+            **self.main_kwargs
+        )
+        
+        self.depformer = Transformer(
+            d_model=self.depformer_dim,
+            dim_feedforward=self.depformer_dim_feedforward,
+            norm=self.norm,
+            device=self.device_type,
+            dtype=torch.float32,
+            **self.dep_kwargs
+        )
+
+    def state_dict(self, *args, **kwargs):
+        """Customize state dict to handle Qwen components properly"""
+        state = super().state_dict(*args, **kwargs)
+        # Don't store the actual Qwen model in state dict to avoid duplication
+        keys_to_remove = [k for k in state.keys() if k.startswith('qwen.')]
+        for k in keys_to_remove:
+            del state[k]
+        return state
+    
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Custom load_state_dict that ignores missing Qwen parameters,
+        but still enforces strictness for all other parameters.
+        """
+        # First do a non-strict load to get the missing and unexpected keys
+        result = super().load_state_dict(state_dict, strict=False)
+        
+        # Filter out Qwen-related missing keys
+        real_missing_keys = [key for key in result.missing_keys if not key.startswith('qwen.')]
+        
+        # If strict is True and there are real missing keys (non-Qwen) or unexpected keys, raise an error
+        if strict and (len(real_missing_keys) > 0 or len(result.unexpected_keys) > 0):
+            error_msg = 'Error(s) in loading state_dict:'
+            if len(result.unexpected_keys) > 0:
+                error_msg += f'\n\tGot unexpected key(s): {result.unexpected_keys}'
+            if len(real_missing_keys) > 0:
+                error_msg += f'\n\tMissing key(s): {real_missing_keys}'
+            raise RuntimeError(error_msg)
+        
+        return torch.nn.modules.module._IncompatibleKeys(real_missing_keys, result.unexpected_keys)
+    
+    def forward_audio(self, sequence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        B, K, S = sequence.shape
+        assert K == self.num_codebooks - 1, f"Expected {self.num_codebooks - 1} codebooks, got {K}"
+        
+        input_ = None # Shape [B, S, dim]
+        # Audio embeddings
+        for cb_index in range(self.num_audio_codebooks):
+            audio_emb = self.emb[cb_index](sequence[:, cb_index])
+            input_ = audio_emb if input_ is None else input_ + audio_emb
+        
+        # Forward through transformer
+        transformer_out = self.transformer(input_)
+        if self.out_norm:
+            transformer_out = self.out_norm(transformer_out)
+            
+        return transformer_out
+    
+    def forward_depformer(self, depformer_cb_index: int, sequence: torch.Tensor,
+                         transformer_out: torch.Tensor) -> torch.Tensor:
+        B, K, S = sequence.shape
+        assert K == 1, "Must pass codebooks one by one"
+        
+        # Embedding of the last token
+        last_token_input = (
+            self.depformer_text_emb(sequence[:, 0]) if depformer_cb_index == 0
+            else self.depformer_emb[depformer_cb_index - 1](sequence[:, 0])
+        )
+        # concat depformer_input and last_token_input on the last dimension
+        depformer_input = torch.cat([transformer_out, last_token_input], dim=-1)
+        # MLP projection
+        depformer_input = self.depformer_projectors[depformer_cb_index if self.depformer_multi_linear else 0](depformer_input)
+        # Forward through depformer
+        depformer_input = depformer_input.view(B*S, 1, -1) # [B, S, dim] -> [B*S, 1, dim]
+        dep_output = self.depformer(depformer_input, depformer_cb_index)
+        dep_output = dep_output.view(B, S, -1) # [B*S, 1, dim] -> [B, S, dim]
+        logits = self.linears[depformer_cb_index](dep_output)[:, None]
+        
+        assert logits.dim() == 4  # [B, Ka, S, card]
+        return logits
+    
 class LMModel(BaseLMModel):
     def _init_transformers(self):
         self.transformer = Transformer(
@@ -364,7 +499,97 @@ class BaseLMGen:
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         raise NotImplementedError("Implement in subclass")
 
+class QwenLMGen(BaseLMGen, nn.Module):
+    """Non-streaming language model generator for Qwen."""
+    def __init__(self, *args, **kwargs):
+        nn.Module.__init__(self)
+        BaseLMGen.__init__(self, *args, **kwargs)
 
+    @torch.no_grad()
+    def generate(self, input_tokens: torch.Tensor, verbose: bool = False) -> tp.Tuple:
+        """Generate text and audio tokens from input tokens."""
+        B, K, T = input_tokens.shape
+        assert input_tokens.dim() == 3, "Shape should be [B, K, T]"
+        # Pass audio
+        audio_tokens = input_tokens[:, 1:, :]
+        audio_out = self.lm_model.forward_audio(audio_tokens)
+        # Pass text
+        text_tokens = input_tokens[:, 0, :]
+        qwen_out = self.lm_model.qwen(text_tokens, output_hidden_states=True, output_attentions=True, output_logits=False)
+        qwen_out = qwen_out.hidden_states[-1]  # B, S, dim where dim = 2048
+        # Concat qwen and audio temporal vectors along the last dimension
+        temporal_out = torch.cat([qwen_out, audio_out], dim=-1)
+        # Get text tokens
+        in_head = self.lm_model.text_projector(temporal_out)
+        text_logits = self.lm_model.text_head(in_head) # B, S, vocab_size where vocab_size = 151936
+        qwen_tokens = self._sample_token(text_logits, is_text=True)
+        # Generate audio tokens
+        audio_tokens, _ = self.depformer_step(qwen_tokens, temporal_out, verbose)
+
+        return text_tokens, audio_tokens
+    
+    def forward(self, batch: torch.Tensor):
+        """Generate text and audio tokens from input tokens."""
+        B, K, T = batch.shape
+        assert batch.dim() == 3, "Shape should be [B, K, T]"
+        # Pass audio
+        audio_tokens = batch[:, 1:, :-1] # Remove last token for FT
+        audio_out = self.lm_model.forward_audio(audio_tokens)
+        # Pass text
+        text_tokens = batch[:, 0, :-1] # Remove last token for FT
+        qwen_out = self.lm_model.qwen(text_tokens, output_hidden_states=True, output_attentions=True, output_logits=False)
+        qwen_out = qwen_out.hidden_states[-1]  # B, S, dim where dim = 2048
+        # Concat qwen and audio temporal vectors along the last dimension
+        temporal_out = torch.cat([qwen_out, audio_out], dim=-1)
+        temporal_out = temporal_out.to(dtype=torch.float32)
+        # Get text tokens
+        in_head = self.lm_model.text_projector(temporal_out)
+        text_logits = self.lm_model.text_head(in_head) # B, S, vocab_size where vocab_size = 151936
+        # qwen_tokens = self._sample_token(text_logits, is_text=True)
+        # Generate audio tokens
+        indices = [0] + list(range(9, K-1))
+        input_ = batch[:, indices, 1:] # Get the text and audio tokens (not the last one)
+        audio_tokens, audio_logits = self.depformer_step(input_, temporal_out)
+
+        return text_logits, audio_logits
+    
+    def depformer_step(
+        self,
+        future_tokens: torch.Tensor,
+        transformer_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, tp.Optional[list[torch.Tensor]]]:
+        """Process tokens through the depformer."""
+        prev_token = None
+        if future_tokens.dim() == 2: # non forced teaching
+            B, T = future_tokens.shape
+            prev_token = future_tokens
+        elif future_tokens.dim() == 3: # forced teaching
+            B, K, T = future_tokens.shape
+        depformer_tokens = []
+        depformer_logits = []
+
+        self.lm_model.depformer.reset_cache(B*T)
+
+        for cb_index in range(self.lm_model.dep_q):
+            if prev_token is not None:
+                input_ = prev_token[:, None, :]
+            else:
+                input_ = future_tokens[:, cb_index, :].unsqueeze(1) # [B, dep_q, T] -> [B, 1, T]
+            logits = self.lm_model.forward_depformer(cb_index, input_, transformer_out)
+            
+            depformer_logits.append(logits.squeeze(1))
+                
+            next_token = self._sample_token(logits) # B, K, T, card -> B, T, card as K=1 
+            next_token = next_token[:, 0, :]  # B,K,T -> B,T
+            depformer_tokens.append(next_token)
+
+            if prev_token is not None:
+                prev_token = next_token
+
+        depformer_logits_tensor = torch.stack(depformer_logits, dim=1)
+        out = torch.stack(depformer_tokens, dim=2)  # [B, T, dep_q]
+        return out, depformer_logits_tensor
+    
 class LMGen(BaseLMGen, nn.Module):
     """Non-streaming language model generator."""
     def __init__(self, *args, **kwargs):
@@ -402,7 +627,7 @@ class LMGen(BaseLMGen, nn.Module):
 
         # Generate audio tokens
         input_ = input_tokens[:, 0:8, :]
-        # Shift text tokens to the left by one
+        # Shift input tokens to the left by one
         input_ = input_[:, :, 1:]
         audio_tokens, depth_logits = self.depformer_step(input_, transformer_out, verbose)
         return text_tokens, audio_tokens, text_logits, depth_logits

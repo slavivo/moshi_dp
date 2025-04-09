@@ -10,5 +10,5 @@ from .compression import (
     CompressionModel,
     MimiModel,
 )
-from .lm import LMModel, LMGen, StreamingLMGen, StreamingLMModel
+from .lm import LMModel, QwenLMGen, LMGen, StreamingLMGen, StreamingLMModel
 from .loaders import get_mimi, get_moshi_lm

@@ -43,7 +43,7 @@ def initialize_model(device: str, moshi_weight: str, tokenizer_path: Optional[st
     text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)
     print("Loading language model...")
     lm = loaders.get_moshi_lm(moshi_weight, device)
-    lm_gen = LMGen(lm, temp=0.0, temp_text=0.0)
+    lm_gen = LMGen(lm, temp=0.5, temp_text=0.5)
     print("Language model loaded successfully")
     
     return lm_gen, text_tokenizer
@@ -64,9 +64,8 @@ def run_generation_step(
             input_tensor[0, 1, -1].copy_(generated_audio[0])
         else:
             input_tensor[0, 1:9, -1].copy_(generated_audio)
-
     start_time = time.time()
-    text_tokens, audio_tokens, text_logits, depth_logits = lm_gen.ft_generate(input_tensor, verbose=True)
+    text_tokens, audio_tokens = lm_gen.generate(input_tensor, verbose=True)
     generation_time = time.time() - start_time
     print(f"Generation time: {generation_time:.2f}s")
 
@@ -78,8 +77,8 @@ def run_generation_step(
         text = text.replace("▁", " ")
         main_text.append(text)
     main_audio.append(generated_audio)
-
-    return text_tokens, audio_tokens, generated_audio, generated_text, text_logits, depth_logits
+    text_logits, depth_logits = None, None
+    return generated_audio, generated_text, text_logits, depth_logits
 
 def main():
     seed_all(42424242)
@@ -98,7 +97,7 @@ def main():
 
     for i in range(len(context)):
         input_tensor = torch.cat([input_tensor, context[i]['input']], dim=2)
-        _, _, generated_audio, generated_text, text_logits, depth_logits = run_generation_step(
+        generated_audio, generated_text, text_logits, depth_logits = run_generation_step(
             input_tensor, generated_audio, generated_text, lm_gen, text_tokenizer,
             i, main_text, main_audio
         )
