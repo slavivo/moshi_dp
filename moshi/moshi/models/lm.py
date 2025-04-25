@@ -336,7 +336,7 @@ class QwenLMModel(BaseLMModel):
             dim_feedforward=self.depformer_dim_feedforward,
             norm=self.norm,
             device=self.device_type,
-            dtype=torch.float32,
+            dtype=self.dtype,
             **self.dep_kwargs
         )
 
@@ -399,6 +399,7 @@ class QwenLMModel(BaseLMModel):
             else self.depformer_emb[depformer_cb_index - 1](sequence[:, 0])
         )
         # concat depformer_input and last_token_input on the last dimension
+        last_token_input = last_token_input.to(dtype=transformer_out.dtype)
         depformer_input = torch.cat([transformer_out, last_token_input], dim=-1)
         # MLP projection
         depformer_input = self.depformer_projectors[depformer_cb_index if self.depformer_multi_linear else 0](depformer_input)
@@ -519,8 +520,9 @@ class QwenLMGen(BaseLMGen, nn.Module):
         in_head = self.lm_model.text_projector(temporal_out)
         text_logits = self.lm_model.text_head(in_head) # B, S, vocab_size where vocab_size = 151936
         qwen_tokens = self._sample_token(text_logits, is_text=True)
+        print(f"qwen_tokens dtype: {qwen_tokens.dtype}")
         # Generate audio tokens
-        audio_tokens, _ = self.depformer_step(qwen_tokens, temporal_out, verbose)
+        audio_tokens, _ = self.depformer_step(qwen_tokens, temporal_out)
 
         return text_tokens, audio_tokens
     

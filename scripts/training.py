@@ -12,6 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from typing import Callable
 import neptune
 from tqdm import tqdm
+from safetensors.torch import save_model
 
 class TensorDictDataset(Dataset):
     """Dataset for loading data from a .pt file containing a list of dicts with 'tensor' keys."""
@@ -412,23 +413,24 @@ def adjust_learning_rate_for_text(optimizer, multiplier):
 
 
 def save_checkpoint(model, optimizers, schedulers, step, args):
-    checkpoint_path = os.path.join(args.save_dir, f"checkpoint_step_{step}.pt")
-    torch.save({
-        'step': step,
-        'model_state_dict': model.state_dict(),
-        'optimizers': {
-            'audio_temporal': optimizers['audio']['temporal'].state_dict(),
-            'audio_depth': optimizers['audio']['depth'].state_dict(),
-            'text_only_temporal': optimizers['text_only']['temporal'].state_dict(),
-            'text_only_depth': optimizers['text_only']['depth'].state_dict(),
-        },
-        'schedulers': {
-            'audio_temporal': schedulers['audio']['temporal'].state_dict(),
-            'audio_depth': schedulers['audio']['depth'].state_dict(),
-            'text_only_temporal': schedulers['text_only']['temporal'].state_dict(),
-            'text_only_depth': schedulers['text_only']['depth'].state_dict(),
-        }
-    }, checkpoint_path)
+    save_model(model.lm_model, os.path.join(args.save_dir, f"model_step_{step}.safetensors"))
+    checkpoint_path = os.path.join(args.save_dir, f"metadata_step_{step}.pt")
+    # TODO - issue with key audio as we don't yet use the text_only
+    # torch.save({
+    #     'step': step,
+    #     'optimizers': {
+    #         'audio_temporal': optimizers['audio']['temporal'].state_dict(),
+    #         'audio_depth': optimizers['audio']['depth'].state_dict(),
+    #         'text_only_temporal': optimizers['text_only']['temporal'].state_dict(),
+    #         'text_only_depth': optimizers['text_only']['depth'].state_dict(),
+    #     },
+    #     'schedulers': {
+    #         'audio_temporal': schedulers['audio']['temporal'].state_dict(),
+    #         'audio_depth': schedulers['audio']['depth'].state_dict(),
+    #         'text_only_temporal': schedulers['text_only']['temporal'].state_dict(),
+    #         'text_only_depth': schedulers['text_only']['depth'].state_dict(),
+    #     }
+    # }, checkpoint_path)
     print(f"Checkpoint saved to {checkpoint_path}")
 
 
@@ -564,8 +566,8 @@ def train(model, dataloaders, optimizers, schedulers, pad_id, args, run):
                 total_steps += 1
                 accum_step = 0
     
-    save_checkpoint(model, optimizers, schedulers, total_steps, args)
     print(f"Training completed. Total epochs: {epoch}, Total steps: {total_steps}, Audio steps: {audio_steps}, Text steps: {text_steps}")
+    save_checkpoint(model, optimizers, schedulers, total_steps, args)
 
 def main():
     args = get_args()
