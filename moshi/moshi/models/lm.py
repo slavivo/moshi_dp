@@ -300,10 +300,6 @@ class QwenLMModel(BaseLMModel):
         super().__init__(*args, **kwargs)
         if not qwen:
             raise ValueError("Qwen model is required")
-        # TODO reinitialize self.depformer_text_emb
-        # TODO remove self.depformer_in
-        # TODO remove self.text_emb
-        # self.depformer_emb and self.linear will be kept and finetuned
         self.depformer_in = None
         self.text_emb = None 
         self.text_linear = None
