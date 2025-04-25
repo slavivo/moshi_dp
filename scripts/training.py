@@ -221,7 +221,7 @@ def initialize_model(device: str, moshi_weight: str, qwen_path: str):
     )
 
     print("Loading LM...")
-    lm = loaders.get_qwen_lm(moshi_weight, qwen, device)
+    lm = loaders.get_qwen_lm(moshi_weight, qwen, torch.float16, torch.float32, device)
     lm_gen = QwenLMGen(lm, temp=0.5, temp_text=0.5)
     
     print("Language model loaded successfully")

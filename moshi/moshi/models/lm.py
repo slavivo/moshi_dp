@@ -65,6 +65,7 @@ class BaseLMModel(nn.Module):
         context: tp.Optional[int] = None,
         device=None,
         dtype=None,
+        depth_dtype=None,
         **kwargs,
     ):
         super().__init__()
@@ -88,6 +89,7 @@ class BaseLMModel(nn.Module):
         self.context = context
         self.device_type = device
         self.dtype = dtype
+        self.depth_dtype = depth_dtype
         self.out_norm = create_norm_fn(norm, dim)
         
         # Initialize embeddings
@@ -336,7 +338,7 @@ class QwenLMModel(BaseLMModel):
             dim_feedforward=self.depformer_dim_feedforward,
             norm=self.norm,
             device=self.device_type,
-            dtype=self.dtype,
+            dtype=self.depth_dtype,
             **self.dep_kwargs
         )
 

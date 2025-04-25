@@ -138,12 +138,13 @@ def get_mimi(filename: str | Path,
     model.set_num_codebooks(8)
     return model
 
-def get_qwen_lm(moshi_weights, qwen, device: torch.device | str = 'cpu') -> LMModel:
+def get_qwen_lm(moshi_weights, qwen, dtype=torch.float16, depth_dtype=torch.float16, device: torch.device | str = 'cpu') -> LMModel:
     """Return a pretrained Qwen model."""
     model = QwenLMModel(
         device=device,
         qwen=qwen,
-        dtype=torch.float16, # TODO change?
+        dtype=dtype, # TODO change?
+        depth_dtype=depth_dtype,
         **_lm_kwargs,
     ).to(device=device, dtype=torch.float16)
     model.eval()
