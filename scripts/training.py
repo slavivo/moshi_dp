@@ -175,7 +175,8 @@ def get_args():
     parser.add_argument("--projector-lr", type=float, default=1e-4, help="Learning rate for Temporal Transformer")
     parser.add_argument("--finetune-lr", type=float, default=5e-6, help="Learning rate for Depth Transformer")
     parser.add_argument("--text-lr-multiplier", type=float, default=0.75, help="Learning rate multiplier for text components in audio batches")
-    parser.add_argument("--padding-loss-weight", type=float, default=0.5, help="Loss weight for padding tokens")
+    parser.add_argument("--padding-weight-audio", type=float, default=0.5, help="Loss weight for padding tokens in audio streams")
+    parser.add_argument("--padding-weight-text", type=float, default=2.0, help="Loss weight for padding tokens in text streams")
     parser.add_argument("--mask-prob", type=float, default=0.3, help="Probability of masking text tokens")
     parser.add_argument("--temporal-shift-min", type=float, default=-0.6, help="Minimum temporal shift in seconds")
     parser.add_argument("--temporal-shift-max", type=float, default=0.6, help="Maximum temporal shift in seconds")
@@ -229,7 +230,7 @@ def initialize_model(device: str, moshi_weight: str, qwen_path: str):
     return lm_gen, qwen_tokenizer
 
 
-def create_data_loaders(args):
+def create_data_loader(args):
     # Define transformations
     # audio_transforms = [
     #     TextTokenMasker(mask_prob=args.mask_prob),
@@ -246,14 +247,6 @@ def create_data_loaders(args):
         is_text_only=False
     )
     
-    # Create text-only dataset
-    # text_dataset = TensorDictDataset(
-    #     pt_file_path=args.text_data,
-    #     transform=None,
-    #     is_text_only=True
-    # )
-    text_dataset = None # TODO change
-    
     # Create data loaders
     audio_loader = DataLoader(
         dataset=audio_dataset,
@@ -263,16 +256,7 @@ def create_data_loaders(args):
         pin_memory=True,
     )
     
-    # text_loader = DataLoader(
-    #     dataset=text_dataset,
-    #     batch_size=args.bs,
-    #     shuffle=True,
-    #     num_workers=2,
-    #     pin_memory=True,
-    # )
-    text_loader = None # TODO change
-    
-    return audio_loader, text_loader
+    return audio_loader
 
 
 def get_model_parameters(model, parameter_type):
@@ -432,38 +416,26 @@ def save_checkpoint(model, optimizers, schedulers, step, args):
     #     }
     # }, checkpoint_path)
     print(f"Checkpoint saved to {checkpoint_path}")
-
-
-def get_next_batch(use_audio, audio_iter, text_iter):
-    if use_audio:
-        batch = next(audio_iter)
-        return batch, "audio"
-    else:
-        batch = next(text_iter)
-        return batch, "text_only"
     
-    
-def calculate_losses(text_logits, audio_logits, target_seq, batch_type, pad_id, args):
+def calculate_losses(text_logits, audio_logits, target_seq, pad_id, args):
     text_loss = compute_loss(
         text_logits, target_seq[:, 0],
         pad_token_id=pad_id,
-        padding_weight=args.padding_loss_weight if batch_type == "audio" else 1.0
+        padding_weight=args.padding_weight_text,
     )
 
-    if batch_type == "audio":
-        audio_losses = [
-            compute_loss(
-                audio_logits[:, i - 9],
-                target_seq[:, i],
-                pad_token_id=0,
-                padding_weight=args.padding_loss_weight,
-                ignore_index=2048
-            )
-            for i in range(9, 17)
-        ]
-        audio_loss = torch.stack(audio_losses).mean()
-        return text_loss + audio_loss
-    return text_loss
+    audio_losses = [
+        compute_loss(
+            audio_logits[:, i - 9],
+            target_seq[:, i],
+            pad_token_id=0,
+            padding_weight=args.padding_weight_audio,
+            ignore_index=2048
+        )
+        for i in range(9, 17)
+    ]
+    audio_loss = torch.stack(audio_losses).mean()
+    return text_loss, audio_loss
 
 def check_grad_nan(model):
     for name, param in model.named_parameters():
@@ -479,30 +451,20 @@ def check_param_nan(model):
             return True
     return False
 
-def train(model, dataloaders, optimizers, schedulers, pad_id, args, run):
-    audio_loader, text_loader = dataloaders
+def train(model, audio_loader, optimizers, schedulers, pad_id, args, run):
     
     total_steps = 0
-    audio_steps = 0
-    text_steps = 0
     accum_step = 0
     epoch = 0
     
-    num_batch = len(audio_loader) # + len(text_loader)
     print(f"Starting training with {args.steps} steps, which corresponds to {args.epoch} epochs")
     
     for epoch in range(args.epoch):
         step_bar = tqdm(range(args.steps), desc=f"Epoch: {epoch + 1}/{args.epoch}", unit="step")
         audio_iter = iter(audio_loader)
-        # text_iter = iter(text_loader)
-        text_iter = None
         while total_steps < args.steps:
-            # use_audio = total_steps % 2 == 0
-            use_audio = True  # TODO change      
             try:
-                batch, batch_type = get_next_batch(use_audio, audio_iter, text_iter)
-                if use_audio: audio_steps += 1
-                else: text_steps += 1
+                batch = next(audio_iter)
             except StopIteration:
                 print("WARNING: Data exhausted before reaching the target steps, starting a new epoch.")
                 break
@@ -523,7 +485,8 @@ def train(model, dataloaders, optimizers, schedulers, pad_id, args, run):
                 print("WARNING: NaN detected in model outputs!")
                 continue
             
-            total_loss = calculate_losses(text_logits, audio_logits, target_seq, batch_type, pad_id, args)
+            text_loss, audio_loss = calculate_losses(text_logits, audio_logits, target_seq, pad_id, args)
+            total_loss = text_loss + audio_loss
 
             if torch.isnan(total_loss).any():
                 print("WARNING: NaN detected in loss calculation!")
@@ -532,6 +495,8 @@ def train(model, dataloaders, optimizers, schedulers, pad_id, args, run):
             # Normalize loss by gradient accumulation steps to maintain scale
             total_loss = total_loss / args.accumulation
             if run:
+                run["train/text_loss"].log(text_loss.item())
+                run["train/audio_loss"].log(audio_loss.item())
                 run["train/loss"].log(total_loss.item() * args.accumulation)
 
             total_loss.backward()
@@ -559,14 +524,13 @@ def train(model, dataloaders, optimizers, schedulers, pad_id, args, run):
 
                 step_bar.set_postfix({
                     "Loss": f"{total_loss.item() * args.accumulation:.4f}",
-                #     "Batch": batch_type,
                     "Max Mem(MB)": f"{mem_used:.2f}",
                 })
                 step_bar.update(1)
                 total_steps += 1
                 accum_step = 0
     
-    print(f"Training completed. Total epochs: {epoch}, Total steps: {total_steps}, Audio steps: {audio_steps}, Text steps: {text_steps}")
+    print(f"Training completed. Total epochs: {epoch}, Total steps: {total_steps}")
     save_checkpoint(model, optimizers, schedulers, total_steps, args)
 
 def main():
@@ -587,17 +551,17 @@ def main():
         run = None
 
     seed_all(args.seed)
-    dataloaders = create_data_loaders(args)
-    steps_per_epoch = len(dataloaders[0]) # TODO maybe add + len(dataloaders[1]) 
+    audio_loader = create_data_loader(args)
+    steps_per_epoch = len(audio_loader)
     if args.steps > 0:
         args.epoch = args.steps // steps_per_epoch + 1 
     else:
-        args.steps = args.epoch * steps_per_epoch # TODO maybe add len(dataloaders[1]) as well    
+        args.steps = args.epoch * steps_per_epoch  
     model, tokenizer = initialize_model(args.device, args.moshi_weight, args.qwen_weight)
     optimizers, schedulers = create_optimizers_and_schedulers(model, args, steps_per_epoch * args.warmup)
     os.makedirs(args.save_dir, exist_ok=True)
 
-    train(model, dataloaders, optimizers, schedulers, tokenizer.pad_token_id, args, run)
+    train(model, audio_loader, optimizers, schedulers, tokenizer.pad_token_id, args, run)
     if run:
         run.stop()
 
