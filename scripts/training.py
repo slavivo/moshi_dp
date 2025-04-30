@@ -164,7 +164,6 @@ def get_args():
     parser.add_argument("--qwen-weight", type=str, default="weights/qwen/")
     parser.add_argument("-e", "--epoch", default=0, type=int, help="Number of epochs to train")
     parser.add_argument("--steps", default=0, type=int, help="Total number of training steps")
-    parser.add_argument("--device", type=str, default='cuda')
     parser.add_argument("--data", type=str, default="training.pt", help="Path to the training data .pt file")
     parser.add_argument("--text-data", type=str, default="training_text.pt", help="Path to text-only training data")
     parser.add_argument("--bs", type=int, default=1, help="Batch size for training")
@@ -206,14 +205,16 @@ def seed_all(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def initialize_model(device: str, moshi_weight: str, qwen_path: str):
+def initialize_model(device: Union[str, Tuple], moshi_weight: str, qwen_path: str):
     print("Loading text tokenizer...")
+    qwen_device = device[0] if type(device) == tuple else device
+    rest_device = device[1] if type(device) == tuple else device
     qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_path)
 
     print("Loading Qwen2.5-3B model...")
     qwen = AutoModelForCausalLM.from_pretrained(
         qwen_path,
-        device_map="auto",
+        device_map=qwen_device,
         torch_dtype=torch.float16,  # Use float16 for efficiency
         trust_remote_code=True,  # Needed for some Qwen-specific code
         output_hidden_states=True,  # Enable hidden states output
@@ -222,7 +223,7 @@ def initialize_model(device: str, moshi_weight: str, qwen_path: str):
     )
 
     print("Loading LM...")
-    lm = loaders.get_qwen_lm(moshi_weight, qwen, torch.float16, torch.float32, device)
+    lm = loaders.get_qwen_lm(moshi_weight, qwen, torch.float16, torch.float32, rest_device)
     lm_gen = QwenLMGen(lm, temp=0.5, temp_text=0.5)
     
     print("Language model loaded successfully")
@@ -279,15 +280,17 @@ def get_model_parameters(model, parameter_type):
 
 def create_optimizers_and_schedulers(model, args, warmup_steps):
     # Get parameters for different components
+    device = args.device if type(args.device) == str else args.device[0]
     for n, p in model.lm_model.named_parameters():
+        # "out_norm.alpha"
         keywords = ["qwen.model", "transformer.layers", "emb."]
         if any(n.lower().startswith(keyword) for keyword in keywords):
             p.requires_grad = False
-            p.data = p.data.to(dtype=torch.float16)
+            p.data = p.data.to(dtype=torch.float16).to(device)
         else:
             p.requires_grad = True
             p.data = p.data.to(dtype=torch.float32)
-        # print(f"Parameter {n}: requires_grad={p.requires_grad}, dtype={p.dtype}")
+        # print(f"Parameter {n}: requires_grad={p.requires_grad}, dtype={p.dtype} device={p.device}")
 
     mem_requires_grad = 0
     mem_non_requires_grad = 0
@@ -452,10 +455,12 @@ def check_param_nan(model):
     return False
 
 def train(model, audio_loader, optimizers, schedulers, pad_id, args, run):
-    
     total_steps = 0
     accum_step = 0
     epoch = 0
+    switch_device = None if type(args.device) == str else args.device[1]
+    device = args.device if type(args.device) == str else args.device[0]
+    devices = (args.device,) if type(args.device) == str else args.device
     
     print(f"Starting training with {args.steps} steps, which corresponds to {args.epoch} epochs")
     
@@ -469,7 +474,7 @@ def train(model, audio_loader, optimizers, schedulers, pad_id, args, run):
                 print("WARNING: Data exhausted before reaching the target steps, starting a new epoch.")
                 break
             
-            batch_tensor = batch['tensor'].to(args.device)
+            batch_tensor = batch['tensor'].to(device)
             batch_tensor = batch_tensor.long()
 
             if accum_step == 0:
@@ -479,7 +484,9 @@ def train(model, audio_loader, optimizers, schedulers, pad_id, args, run):
             # We don't need to shift input as we use Forced Teaching
             target_seq = batch_tensor[:, :, 1:]
 
-            text_logits, audio_logits = model.forward(batch_tensor)
+            text_logits, audio_logits = model.forward(batch_tensor, switch_device)
+            text_logits = text_logits.to(device) if text_logits is not None else None
+            audio_logits = audio_logits.to(device) if audio_logits is not None else None
 
             if torch.isnan(text_logits).any() or (audio_logits is not None and torch.isnan(audio_logits).any()):
                 print("WARNING: NaN detected in model outputs!")
@@ -501,7 +508,10 @@ def train(model, audio_loader, optimizers, schedulers, pad_id, args, run):
 
             total_loss.backward()
 
-            mem_used = torch.cuda.max_memory_allocated() / 1024**2
+            mem_used = ""
+            for d in devices:
+                tmp = torch.cuda.max_memory_allocated(d) / 1024**2
+                mem_used += f"{tmp:.2f}MB "
 
             if check_grad_nan(model):
                 accum_step = 0
@@ -524,7 +534,7 @@ def train(model, audio_loader, optimizers, schedulers, pad_id, args, run):
 
                 step_bar.set_postfix({
                     "Loss": f"{total_loss.item() * args.accumulation:.4f}",
-                    "Max Mem(MB)": f"{mem_used:.2f}",
+                    "Max Mem(MB)": mem_used,
                 })
                 step_bar.update(1)
                 total_steps += 1
@@ -539,6 +549,13 @@ def main():
         raise ValueError("Either --steps or --epoch must be specified.")
     if args.steps > 0 and args.epoch > 0:
         raise ValueError("Only one of --steps or --epoch can be specified.")
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        raise RuntimeError("No GPUs available for training.")
+    if num_gpus == 1:
+        args.device = "cuda:0"
+    else:
+        args.device = ("cuda:0", "cuda:1")
 
     if args.neptune:
         neptune_token = os.getenv("NEPTUNE_API_TOKEN")
@@ -556,7 +573,7 @@ def main():
     if args.steps > 0:
         args.epoch = args.steps // steps_per_epoch + 1 
     else:
-        args.steps = args.epoch * steps_per_epoch  
+        args.steps = args.epoch * steps_per_epoch 
     model, tokenizer = initialize_model(args.device, args.moshi_weight, args.qwen_weight)
     optimizers, schedulers = create_optimizers_and_schedulers(model, args, steps_per_epoch * args.warmup)
     os.makedirs(args.save_dir, exist_ok=True)
