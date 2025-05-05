@@ -22,13 +22,11 @@ class TensorDictDataset(Dataset):
         transform: Optional[List[Callable]] = None,
         context_size: int = 750,
         overlap: float = 0.1,
-        is_text_only: bool = False
     ):
         self.pt_file_path = pt_file_path
         self.transform = transform
         self.context_size = context_size
         self.overlap = int(context_size * overlap)
-        self.is_text_only = is_text_only
         
         self.data = torch.load(pt_file_path, weights_only=True)
         self.chunk_indeces = self._build_chunk_index()
@@ -69,7 +67,6 @@ class TensorDictDataset(Dataset):
 
         return {
             'tensor': chunk,
-            'is_text_only': self.is_text_only,
         }
     
 class TextTokenMasker:
@@ -112,46 +109,50 @@ class TextTokenMasker:
 
 class TemporalShifter:
     """Shift the timing between text and audio tokens."""
-    def __init__(self, min_shift: float = -0.6, max_shift: float = 0.6, fps: int = 50):
-        self.min_shift = min_shift
-        self.max_shift = max_shift
-        self.fps = fps  # Assuming 50 tokens per second
+    def __init__(self, min_shift: float = -0.56, max_shift: float = 0.56, hz: float = 12.5, prob: float = 0.3):
+        ms = 1000 / hz
+        self.min_shift = int(min_shift * 1000 / ms)
+        self.max_shift = int(max_shift * 1000 / ms)
+        self.hz = hz
+        self.ms = ms
+        self.prob = prob
     
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        shift_seconds = random.uniform(self.min_shift, self.max_shift)
-        shift_tokens = int(shift_seconds * self.fps)
+        if random.random() > self.prob:
+            return x
+
+        shift_tokens = random.randint(self.min_shift, self.max_shift)
         
         # Handle both batched and unbatched inputs
         if x.dim() == 3:  # (B, 17, T)
-            batch_size, num_streams, seq_len = x.shape
             x_shifted = x.clone()
             
             if shift_tokens > 0:
-                # Shift audio streams (1-16) forward relative to text
+                # Shift and pad audio streams (1-16) forward relative to text
+                pad_token = x_shifted[0, 1, 0]
                 x_shifted[:, 1:, shift_tokens:] = x[:, 1:, :-shift_tokens]
-                x_shifted[:, 1:, :shift_tokens] = 0  # Pad with zeros
+                x_shifted[:, 1:, :shift_tokens] = pad_token
             elif shift_tokens < 0:
-                # Shift audio streams backward relative to text
+                # Shift and pad text stream forward relative to audio
                 abs_shift = abs(shift_tokens)
-                x_shifted[:, 1:, :-abs_shift] = x[:, 1:, abs_shift:]
-                x_shifted[:, 1:, -abs_shift:] = 0  # Pad with zeros
+                pad_token = x_shifted[0, 0, 0]
+                x_shifted[:, 0, shift_tokens:] = x[:, 0, :-shift_tokens]
+                x_shifted[:, 0, :shift_tokens] = pad_token
             
             return x_shifted
         
         elif x.dim() == 2:  # (17, T)
-            num_streams, seq_len = x.shape
             x_shifted = x.clone()
             
             if shift_tokens > 0:
-                # Shift audio streams (1-16) forward relative to text
+                # Shift and pad audio streams (1-16) forward relative to text
                 x_shifted[1:, shift_tokens:] = x[1:, :-shift_tokens]
                 x_shifted[1:, :shift_tokens] = 0  # Pad with zeros
             elif shift_tokens < 0:
-                # Shift audio streams backward relative to text
+                # Shift and pad text stream forward relative to audio
                 abs_shift = abs(shift_tokens)
-                x_shifted[1:, :-abs_shift] = x[1:, abs_shift:]
-                x_shifted[1:, -abs_shift:] = 0  # Pad with zeros
-            
+                x_shifted[0, abs_shift:] = x[0, :-abs_shift]
+                x_shifted[0, :abs_shift] = 0
             return x_shifted
         
         else:
@@ -177,8 +178,9 @@ def get_args():
     parser.add_argument("--padding-weight-audio", type=float, default=0.5, help="Loss weight for padding tokens in audio streams")
     parser.add_argument("--padding-weight-text", type=float, default=2.0, help="Loss weight for padding tokens in text streams")
     parser.add_argument("--mask-prob", type=float, default=0.3, help="Probability of masking text tokens")
-    parser.add_argument("--temporal-shift-min", type=float, default=-0.6, help="Minimum temporal shift in seconds")
-    parser.add_argument("--temporal-shift-max", type=float, default=0.6, help="Maximum temporal shift in seconds")
+    parser.add_argument("--temporal-shift-min", type=float, default=-0.54, help="Minimum temporal shift in seconds")
+    parser.add_argument("--temporal-shift-max", type=float, default=0.54, help="Maximum temporal shift in seconds")
+    parser.add_argument("--temporal-shift-prob", type=float, default=0.3, help="Probability of applying temporal shift")
     parser.add_argument("--accumulation", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--clip", type=float, default=0.0, help="Maximum norm for gradient clipping")
     parser.add_argument("--seed", type=int, default=13, help="Random seed")
@@ -233,19 +235,16 @@ def initialize_model(device: Union[str, Tuple], moshi_weight: str, qwen_path: st
 
 def create_data_loader(args):
     # Define transformations
-    # audio_transforms = [
-    #     TextTokenMasker(mask_prob=args.mask_prob),
-    #     TemporalShifter(min_shift=args.temporal_shift_min, max_shift=args.temporal_shift_max)
-    # ]
-    audio_transforms = None # TODO change
+    audio_transforms = [
+        TemporalShifter(min_shift=args.temporal_shift_min, max_shift=args.temporal_shift_max, prob=args.temporal_shift_prob),
+    ]
 
     # Create audio dataset
     audio_dataset = TensorDictDataset(
         pt_file_path=args.data, 
         transform=audio_transforms,
         context_size=args.context,
-        overlap=args.overlap,
-        is_text_only=False
+        overlap=args.overlap
     )
     
     # Create data loaders
@@ -281,16 +280,21 @@ def get_model_parameters(model, parameter_type):
 def create_optimizers_and_schedulers(model, args, warmup_steps):
     # Get parameters for different components
     device = args.device if type(args.device) == str else args.device[0]
+    frozen_size = 0
+    unfrozen_size = 0
     for n, p in model.lm_model.named_parameters():
-        # "out_norm.alpha"
         keywords = ["qwen.model", "transformer.layers", "emb."]
         if any(n.lower().startswith(keyword) for keyword in keywords):
-            p.requires_grad = False
+            p.requires_grad = False # Freeze these parameters
             p.data = p.data.to(dtype=torch.float16).to(device)
+            frozen_size += p.numel() * p.element_size()
         else:
             p.requires_grad = True
             p.data = p.data.to(dtype=torch.float32)
+            unfrozen_size += p.numel() * p.element_size()
         # print(f"Parameter {n}: requires_grad={p.requires_grad}, dtype={p.dtype} device={p.device}")
+    # print(f"Frozen size: {frozen_size / 1024**2} MB")
+    # print(f"Unfrozen size: {unfrozen_size / 1024**2} MB")
 
     mem_requires_grad = 0
     mem_non_requires_grad = 0
@@ -454,7 +458,8 @@ def check_param_nan(model):
             return True
     return False
 
-def train(model, audio_loader, optimizers, schedulers, pad_id, args, run):
+def train(model, audio_loader, optimizers, schedulers, tokenizer, args, run):
+    pad_id = tokenizer.pad_token_id
     total_steps = 0
     accum_step = 0
     epoch = 0
@@ -578,7 +583,7 @@ def main():
     optimizers, schedulers = create_optimizers_and_schedulers(model, args, steps_per_epoch * args.warmup)
     os.makedirs(args.save_dir, exist_ok=True)
 
-    train(model, audio_loader, optimizers, schedulers, tokenizer.pad_token_id, args, run)
+    train(model, audio_loader, optimizers, schedulers, tokenizer, args, run)
     if run:
         run.stop()
 
