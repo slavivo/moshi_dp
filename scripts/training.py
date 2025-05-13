@@ -5,7 +5,7 @@ import random
 import numpy as np
 from torch import nn
 from moshi.models import loaders, QwenLMGen
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 import os
 from torch.utils.data import Dataset, DataLoader, Subset
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -13,6 +13,8 @@ from typing import Callable
 import neptune
 from tqdm import tqdm
 from safetensors.torch import save_model
+
+torch.set_float32_matmul_precision('high')
 
 class TensorDictDataset(Dataset):
     """Dataset for loading data from a .pt file containing a list of dicts with 'tensor' keys."""
@@ -214,14 +216,19 @@ def initialize_model(device: Union[str, Tuple], moshi_weight: str, qwen_path: st
     qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_path)
 
     print("Loading Qwen2.5-3B model...")
+    config = AutoConfig.from_pretrained(qwen_path, trust_remote_code=True)
+    config.sliding_window = None
+    config.output_hidden_states = True
+    config.output_attentions = False
+    config.attn_implementation = "flash_attention_2"
+    config.return_dict_in_generate = True
+
     qwen = AutoModelForCausalLM.from_pretrained(
         qwen_path,
+        config=config,
         device_map=qwen_device,
         torch_dtype=torch.float16,  # Use float16 for efficiency
         trust_remote_code=True,  # Needed for some Qwen-specific code
-        output_hidden_states=True,  # Enable hidden states output
-        output_attentions=True,  # Also enable attentions if needed
-        return_dict_in_generate=True  # Return a model output object instead of just tokens
     )
 
     print("Loading LM...")
@@ -289,7 +296,11 @@ def create_optimizers_and_schedulers(model, args, warmup_steps):
             p.data = p.data.to(dtype=torch.float16).to(device)
             frozen_size += p.numel() * p.element_size()
         else:
-            p.requires_grad = True
+            # TODO freeze embedding layers of DT
+            if not (n.lower().startswith("depformer_emb") or n.lower().startswith("depformer_text_emb")):
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
             p.data = p.data.to(dtype=torch.float32)
             unfrozen_size += p.numel() * p.element_size()
         # print(f"Parameter {n}: requires_grad={p.requires_grad}, dtype={p.dtype} device={p.device}")
@@ -573,13 +584,13 @@ def main():
         run = None
 
     seed_all(args.seed)
+    model, tokenizer = initialize_model(args.device, args.moshi_weight, args.qwen_weight)
     audio_loader = create_data_loader(args)
     steps_per_epoch = len(audio_loader)
     if args.steps > 0:
         args.epoch = args.steps // steps_per_epoch + 1 
     else:
         args.steps = args.epoch * steps_per_epoch 
-    model, tokenizer = initialize_model(args.device, args.moshi_weight, args.qwen_weight)
     optimizers, schedulers = create_optimizers_and_schedulers(model, args, steps_per_epoch * args.warmup)
     os.makedirs(args.save_dir, exist_ok=True)
 
