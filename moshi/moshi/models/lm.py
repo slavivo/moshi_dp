@@ -286,16 +286,24 @@ class StreamingLMModel(BaseLMModel, StreamingContainer):
 class MLPProjector(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim)
-        )
+        self.norm = nn.LayerNorm(input_dim)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+        nn.init.kaiming_normal_(self.fc1.weight, nonlinearity='relu')
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x):
-        return self.mlp(x)
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
 
 class QwenLMModel(BaseLMModel):
     def __init__(self, *args, qwen=None, **kwargs):
@@ -303,7 +311,7 @@ class QwenLMModel(BaseLMModel):
         if not qwen:
             raise ValueError("Qwen model is required")
         self.depformer_in = None
-        self.text_emb = None 
+        self.text_emb = None
         self.text_linear = None
         
         self.qwen = qwen
@@ -319,8 +327,29 @@ class QwenLMModel(BaseLMModel):
         self.depformer_projectors = nn.ModuleList(
             [MLPProjector(4096+2048+1024, 4096, 1024).to(self.device) for _ in range(self.dep_q)]
         )
-        # TODO remove +1
-        self.depformer_text_emb = self.EmbeddingFactory(qwen.config.vocab_size, self.depformer_dim)
+
+        original_emb = qwen.get_input_embeddings()
+        embedding_matrix = original_emb.weight.data.float()
+        self.depformer_text_emb = nn.Embedding(
+            num_embeddings = original_emb.num_embeddings,
+            embedding_dim= original_emb.embedding_dim,
+            device=self.device,
+            dtype=self.depth_dtype,
+        )
+        self.depformer_text_emb.weight.data.copy_(embedding_matrix)
+
+        self.depformer_text_proj = nn.Linear(qwen.config.hidden_size, self.depformer_dim, bias=True).to(self.device)
+
+        # Perform PCA for initialization
+        mean_embedding = embedding_matrix.mean(dim=0, keepdim=True)
+        centered_embeddings = embedding_matrix - mean_embedding
+        U, S, Vt = torch.linalg.svd(centered_embeddings, full_matrices=False)
+        truncated_vt = Vt[:self.depformer_dim, :]
+
+        self.depformer_text_proj.weight.data.copy_(truncated_vt.to(self.device))
+        mean_projection = torch.matmul(mean_embedding, truncated_vt.t())
+        self.depformer_text_proj.bias.data.copy_(-mean_projection.squeeze(0))
+        
 
     def _init_transformers(self):
         self.transformer = Transformer(
@@ -400,6 +429,9 @@ class QwenLMModel(BaseLMModel):
             self.depformer_text_emb(sequence[:, 0]) if depformer_cb_index == 0
             else self.depformer_emb[depformer_cb_index - 1](sequence[:, 0])
         )
+        # Project if we are working with text
+        if depformer_cb_index == 0:
+            last_token_input = self.depformer_text_proj(last_token_input)
         # concat depformer_input and last_token_input on the last dimension
         last_token_input = last_token_input.to(dtype=transformer_out.dtype)
         depformer_input = torch.cat([transformer_out, last_token_input], dim=-1)
@@ -510,10 +542,12 @@ class QwenLMGen(BaseLMGen, nn.Module):
         B, K, T = input_tokens.shape
         assert input_tokens.dim() == 3, "Shape should be [B, K, T]"
         # Pass audio
+        print(f"Device of input_tokens: {input_tokens.device}")
         audio_tokens = input_tokens[:, 1:, :]
         audio_out = self.lm_model.forward_audio(audio_tokens)
         # Pass text
         text_tokens = input_tokens[:, 0, :]
+        print(f"Device of qwen model: {self.lm_model.qwen.device}")
         qwen_out = self.lm_model.qwen(text_tokens, output_hidden_states=True, output_attentions=True, output_logits=False)
         qwen_out = qwen_out.hidden_states[-1]  # B, S, dim where dim = 2048
         # Concat qwen and audio temporal vectors along the last dimension
@@ -528,20 +562,24 @@ class QwenLMGen(BaseLMGen, nn.Module):
 
         return text_tokens, audio_tokens
     
-    def forward(self, batch: torch.Tensor):
+    def forward(self, batch: torch.Tensor, switch_device: str = None):
         """Generate text and audio tokens from input tokens."""
         B, K, T = batch.shape
         assert batch.dim() == 3, "Shape should be [B, K, T]"
         # Pass audio
-        audio_tokens = batch[:, 1:, :-1] # Remove last token for FT
-        audio_out = self.lm_model.forward_audio(audio_tokens)
-        # Pass text
-        text_tokens = batch[:, 0, :-1] # Remove last token for FT
-        qwen_out = self.lm_model.qwen(text_tokens, output_hidden_states=True, output_attentions=True, output_logits=False)
-        qwen_out = qwen_out.hidden_states[-1]  # B, S, dim where dim = 2048
+        with torch.no_grad():
+            audio_tokens = batch[:, 1:, :-1] # Remove last token for FT
+            audio_out = self.lm_model.forward_audio(audio_tokens)
+            # Pass text
+            text_tokens = batch[:, 0, :-1] # Remove last token for FT
+            qwen_out = self.lm_model.qwen(text_tokens, output_hidden_states=True, output_attentions=False, output_logits=False)
+            qwen_out = qwen_out.hidden_states[-1]  # B, S, dim where dim = 2048
         # Concat qwen and audio temporal vectors along the last dimension
         temporal_out = torch.cat([qwen_out, audio_out], dim=-1)
         temporal_out = temporal_out.to(dtype=torch.float32)
+        # Move the tensor to the second device
+        if switch_device is not None:
+            temporal_out = temporal_out.to(switch_device)
         # Get text tokens
         in_head = self.lm_model.text_projector(temporal_out)
         text_logits = self.lm_model.text_head(in_head) # B, S, vocab_size where vocab_size = 151936
@@ -549,6 +587,8 @@ class QwenLMGen(BaseLMGen, nn.Module):
         # Generate audio tokens
         indices = [0] + list(range(9, K-1))
         input_ = batch[:, indices, 1:] # Get the text and audio tokens (not the last one)
+        if switch_device is not None:
+            input_ = input_.to(switch_device)
         audio_tokens, audio_logits = self.depformer_step(input_, temporal_out)
 
         return text_logits, audio_logits
@@ -575,6 +615,7 @@ class QwenLMGen(BaseLMGen, nn.Module):
                 input_ = prev_token[:, None, :]
             else:
                 input_ = future_tokens[:, cb_index, :].unsqueeze(1) # [B, dep_q, T] -> [B, 1, T]
+            
             logits = self.lm_model.forward_depformer(cb_index, input_, transformer_out)
             
             depformer_logits.append(logits.squeeze(1))

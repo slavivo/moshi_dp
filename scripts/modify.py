@@ -18,16 +18,24 @@ import threading
 class MLPProjector(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim)
-        )
+        self.norm = nn.LayerNorm(input_dim)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+        nn.init.kaiming_normal_(self.fc1.weight, nonlinearity='relu')
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x):
-        return self.mlp(x)
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--moshi-weight", type=str)
@@ -52,7 +60,8 @@ qwen = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.float16,  # Use float16 for efficiency
     trust_remote_code=True,  # Needed for some Qwen-specific code
     output_hidden_states=True,  # Enable hidden states output
-    output_attentions=True,  # Also enable attentions if needed
+    output_attentions=False,
+    attn_implementation="flash_attention_2",
     return_dict_in_generate=True  # Return a model output object instead of just tokens
 )
 
@@ -71,8 +80,27 @@ lm.text_head.to(dtype=qwen.get_output_embeddings().weight.dtype, device=lm.devic
 lm.depformer_projectors = nn.ModuleList(
     [MLPProjector(4096+2048+1024, 4096, 1024).to(lm.device) for _ in range(lm.dep_q)]
 )
-# TODO should this really be from scratch? Can't we instead somehow use emb of Qwen?
-lm.depformer_text_emb = lm.EmbeddingFactory(qwen.config.vocab_size, lm.depformer_dim)
+original_emb = qwen.get_input_embeddings()
+embedding_matrix = original_emb.weight.data.float()
+lm.depformer_text_emb = nn.Embedding(
+    num_embeddings = original_emb.num_embeddings,
+    embedding_dim= original_emb.embedding_dim,
+    device=lm.device,
+    dtype=lm.depth_dtype,
+)
+lm.depformer_text_emb.weight.data.copy_(embedding_matrix)
+# TODO think if this should be linear or MLP
+lm.depformer_text_proj = nn.Linear(qwen.config.hidden_size, lm.depformer_dim, bias=True).to(lm.device)
+# Perform PCA for initialization
+mean_embedding = embedding_matrix.mean(dim=0, keepdim=True)
+centered_embeddings = embedding_matrix - mean_embedding
+U, S, Vt = torch.linalg.svd(centered_embeddings, full_matrices=False)
+truncated_vt = Vt[:lm.depformer_dim, :]
+
+lm.depformer_text_proj.weight.data.copy_(truncated_vt.to(lm.device))
+mean_projection = torch.matmul(mean_embedding, truncated_vt.t())
+lm.depformer_text_proj.bias.data.copy_(-mean_projection.squeeze(0))
+
 lm.depformer_in = None
 lm.text_emb = None
 lm.text_linear = None
